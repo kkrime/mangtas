@@ -15,7 +15,10 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-type DBConfig struct {
+// using gorm ORM library
+
+// for db config file
+type dbConfig struct {
 	Host     string
 	Port     string
 	Dbname   string
@@ -24,19 +27,22 @@ type DBConfig struct {
 }
 
 const (
+	// db config file location
 	LOCAL_DB_CONFIG = "./config/dbConfig.json"
 
+	// db config file error message
 	CONFIG_FILE_ERROR = "error with config file %v error %v"
 )
 
 var (
+	// db
 	db *gorm.DB
 )
 
 func init() {
 
-	newLogger := logger.New(
-		// log.New(os.Stdout, "\r\n", log.LstdFlags),
+	// db logger
+	dbLogger := logger.New(
 		log.New(),
 		logger.Config{
 			SlowThreshold:             time.Second,
@@ -50,23 +56,24 @@ func init() {
 	dbconfig := readDBConfig()
 
 	var err error
+
 	// attempt to connect to database
 	dsn := fmt.Sprintf("host=%v user=%v password=%v dbname=%v port=%v sslmode=disable TimeZone=UTC",
 		dbconfig.Host, dbconfig.Username, dbconfig.Password, dbconfig.Dbname, dbconfig.Port)
 	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{
-		// Logger: newLogger})
-		Logger: newLogger})
+		Logger: dbLogger})
 	if err != nil {
-		// db does not exist
+		// if db does not exist
 		if strings.Contains(err.Error(), "SQLSTATE 3D000") {
 
+			// close db connection
 			closeDBconnection()
 
 			// connect to db server without specifying a db
 			dsn = fmt.Sprintf("host=%v user=%v password=%v port=%v sslmode=disable TimeZone=UTC",
 				dbconfig.Host, dbconfig.Username, dbconfig.Password, dbconfig.Port)
 			db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{
-				Logger: newLogger})
+				Logger: dbLogger})
 			if err != nil {
 				log.Panic("failed to connect database")
 			}
@@ -74,17 +81,17 @@ func init() {
 			// create db
 			stmt := fmt.Sprintf("CREATE DATABASE %s;", dbconfig.Dbname)
 			if rs := db.Exec(stmt); rs.Error != nil {
-				fmt.Println(rs.Error)
-				// return rs.Error
+				log.Panic(rs.Error)
 			}
 
+			// close db connection
 			closeDBconnection()
 
-			// reconnect to db
+			// reconnect to newly created db
 			dsn = fmt.Sprintf("host=%v user=%v password=%v dbname=%v port=%v sslmode=disable TimeZone=UTC",
 				dbconfig.Host, dbconfig.Username, dbconfig.Password, dbconfig.Dbname, dbconfig.Port)
 			db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{
-				Logger: newLogger})
+				Logger: dbLogger})
 			if err != nil {
 				log.Panic("failed to connect database")
 			}
@@ -94,15 +101,15 @@ func init() {
 
 	}
 
-	// sanity check
-	err = db.AutoMigrate(&Words{})
+	// create/sanity check
+	err = db.AutoMigrate(&Word{})
 	if err != nil {
 		log.Panic("migration failed")
 	}
 }
 
-func readDBConfig() DBConfig {
-	var dbconfig DBConfig
+func readDBConfig() dbConfig {
+	var dbconfig dbConfig
 
 	configFile := LOCAL_DB_CONFIG
 
@@ -130,66 +137,104 @@ func closeDBconnection() {
 	}
 }
 
-type Words struct {
+// word is a row in the 'words' db table
+type Word struct {
 	gorm.Model
 	Word  string `gorm:"uniqueIndex"`
 	Count int
 }
 
-func addWordsDB(words []string) error {
-	err := db.Transaction(func(tx *gorm.DB) error {
+// each word is added in its own thread
+func addWordsDB(wordCountMap map[string]int) error {
 
-		errorChans := make([]chan error, len(words))
+	// channels to send errors/let us know when threads have finished running
+	errorChans := make([]chan struct{}, len(wordCountMap))
+	// tx for each word/thread
+	txs := make([]*gorm.DB, len(wordCountMap))
 
-		for i, word := range words {
+	// i to keep track of loop iteration count
+	i := 0
+	for word, count := range wordCountMap {
 
-			errorChans[i] = make(chan error)
+		// channel for thread
+		errorChans[i] = make(chan struct{})
 
-			go func(word string, errorChan chan<- error) {
-				defer func() {
-					close(errorChan)
-				}()
+		// goroutine to connect + add word to db
+		go func(txIndex int, word string, count int, errorChan chan<- struct{}) {
+			// create new db tx
+			txs[txIndex] = db.Begin()
+			tx := txs[txIndex]
 
-				err := db.Transaction(func(tx *gorm.DB) error {
-
-					lowerCaseWord := strings.ToLower(word)
-
-					wordRecord := Words{Word: lowerCaseWord}
-
-					if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-						Where("word", word).
-						FirstOrCreate(&wordRecord).Error; err != nil {
-						return err
-					}
-
-					wordRecord.Count += 1
-					tx.Save(wordRecord)
-					return nil
-				})
-
+			var err error
+			// on exit log + send errors through error chan and close error chan
+			defer func() {
 				if err != nil {
-					errorChan <- err
+					log.Error(err)
+					errorChan <- struct{}{}
 				}
+				close(errorChan)
+			}()
 
-			}(word, errorChans[i])
-		}
+			// create empty word record
+			wordRecord := Word{Word: word}
 
-		errorr := false
-		for _, errChan := range errorChans {
-			for err := range errChan {
-				errorr = true
-
-				// log error
-				log.Error(err)
+			// try to get word if exists, if not create word record in db and lock it
+			if err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("word", word).
+				FirstOrCreate(&wordRecord).Error; err != nil {
+				return
 			}
-		}
 
-		if errorr {
-			return fmt.Errorf("internal error")
-		}
+			// increment count of word
+			wordRecord.Count += count
+			// save record to db
+			err = tx.Save(wordRecord).Error
 
-		return nil
-	})
-	return err
+		}(i, word, count, errorChans[i])
+
+		i += 1
+	}
+
+	// check if any of the threads failed by checking the errorchans
+	errorr := false
+	for _, errChan := range errorChans {
+		for _ = range errChan {
+			errorr = true
+			// no break because it might cause a goroutine leak and life is too short
+			// break
+		}
+	}
+
+	// talk about the corner case
+
+	// all or nothing commit to db
+	if errorr {
+		// go func(txs []*gorm.DB) {
+		for _, tx := range txs {
+			tx.Rollback()
+		}
+		// }(txs)
+		return fmt.Errorf("internal error")
+	} else {
+		// go func(txs []*gorm.DB) {
+		for _, tx := range txs {
+			tx.Commit()
+		}
+		// }(txs)
+	}
+
+	return nil
+}
+
+func getTopWordsDB() ([]wordOut, error) {
+
+	// NOTE using wordOut struct and not words
+	var topWords []wordOut
+	err := db.Table("words").
+		Order("count desc").
+		Limit(10).
+		Find(&topWords).Error
+
+	return topWords, err
 
 }

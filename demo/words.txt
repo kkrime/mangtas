@@ -1,0 +1,10 @@
+ten,ten,ten,ten,ten,ten,ten,ten,ten,ten,
+nine,nine,nine,nine,nine,nine,nine,nine,nine,
+eight,eight,eight,eight,eight,eight,eight,eight,
+seven,seven,seven,seven,seven,seven,seven,
+six,six,six,six,six,six,
+five,five,five,five,five,
+four,four,four,four,
+three,three,three,
+two,two,
+one
